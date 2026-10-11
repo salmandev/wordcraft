@@ -37,7 +37,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("equation.move", "Move in Equation", "Equation", move_caret)
             .pure()
             .when(editing)
-            .params(r#"{"dir": "left|right|up|down|home|end|next|prev"}"#),
+            .params(r#"{"dir": "left|right|up|down|home|end|next|prev", "extend"?: bool}"#),
         CommandSpec::new("equation.backspace", "Delete Back in Equation", "Equation", |s, _| delete(s, true)).when(editing),
         CommandSpec::new("equation.delete", "Delete in Equation", "Equation", |s, _| delete(s, false)).when(editing),
         CommandSpec::new("equation.enter", "Enter in Equation", "Equation", enter).when(editing),
@@ -179,7 +179,7 @@ fn insert_nodes_as_equation(s: &mut Session, nodes: Arg, v: &Value) -> CmdResult
     let end = s.doc.insert_object(&at, obj, &props)?;
     if p::bool(v, "edit").unwrap_or(true) {
         s.sel = Selection::caret(at.clone());
-        s.math = Some(MathEdit { at, pos: caret });
+        s.math = Some(MathEdit { at, pos: caret, anchor: None });
     } else {
         s.sel = Selection::caret(end);
     }
@@ -201,7 +201,7 @@ fn edit(s: &mut Session, v: &Value) -> CmdResult {
     let pos =
         v.get("pos").and_then(|p| serde_json::from_value::<MathPos>(p.clone()).ok()).unwrap_or_else(|| MathPos::new(Vec::new(), me::units(&nodes)));
     s.sel = Selection::caret(at.clone());
-    s.math = Some(MathEdit { pos: me::clamp(&nodes, &pos), at });
+    s.math = Some(MathEdit { pos: me::clamp(&nodes, &pos), at, anchor: None });
     result(s)
 }
 
@@ -225,6 +225,11 @@ fn type_text(s: &mut Session, v: &Value) -> CmdResult {
     let style = TypeStyle { nor: s.math_normal_text };
     let mut pos = m.pos.clone();
     with_eq(s, &m.at, |math, _| {
+        if let Some(anchor) = &m.anchor
+            && let Some(next) = me::delete_range(&mut math.nodes, anchor, &pos)
+        {
+            pos = next;
+        }
         if math.linear {
             // Linear form is plain text: no build-up.
             pos = me::insert_text(&mut math.nodes, &pos, &text, TypeStyle::default());
@@ -252,6 +257,7 @@ fn type_text(s: &mut Session, v: &Value) -> CmdResult {
     })?;
     if let Some(m) = s.math.as_mut() {
         m.pos = pos;
+        m.anchor = None;
     }
     result(s)
 }
@@ -274,14 +280,25 @@ fn insert_structure(s: &mut Session, v: &Value) -> CmdResult {
     let mut pos = m.pos.clone();
     with_eq(s, &m.at, |math, _| {
         if math.linear {
+            if let Some(anchor) = &m.anchor
+                && let Some(next) = me::delete_range(&mut math.nodes, anchor, &pos)
+            {
+                pos = next;
+            }
             pos = me::insert_text(&mut math.nodes, &pos, &to_linear(&nodes), TypeStyle::default());
             set_literal(&mut math.nodes);
         } else {
+            if let Some(anchor) = &m.anchor
+                && let Some(next) = me::delete_range(&mut math.nodes, anchor, &pos)
+            {
+                pos = next;
+            }
             pos = me::insert_nodes(&mut math.nodes, &pos, nodes);
         }
     })?;
     if let Some(m) = s.math.as_mut() {
         m.pos = pos;
+        m.anchor = None;
     }
     result(s)
 }
@@ -297,6 +314,11 @@ fn insert_symbol(s: &mut Session, v: &Value) -> CmdResult {
     let mut pos = m.pos.clone();
     let style = TypeStyle { nor: s.math_normal_text };
     with_eq(s, &m.at, |math, _| {
+        if let Some(anchor) = &m.anchor
+            && let Some(next) = me::delete_range(&mut math.nodes, anchor, &pos)
+        {
+            pos = next;
+        }
         pos = me::insert_text(&mut math.nodes, &pos, &c, style);
         if math.linear {
             set_literal(&mut math.nodes);
@@ -304,6 +326,7 @@ fn insert_symbol(s: &mut Session, v: &Value) -> CmdResult {
     })?;
     if let Some(m) = s.math.as_mut() {
         m.pos = pos;
+        m.anchor = None;
     }
     result(s)
 }
@@ -319,11 +342,22 @@ fn nodes_of(s: &Session, at: &Pos) -> Option<Arg> {
 
 fn move_caret(s: &mut Session, v: &Value) -> CmdResult {
     let m = current(s)?;
+    let dir = p::str(v, "dir").unwrap_or("right");
+    let extend = p::bool(v, "extend").unwrap_or(false);
+    if !extend && let Some(anchor) = &m.anchor {
+        let earlier = matches!(dir, "left" | "up" | "home" | "prev");
+        let pos = if earlier == (anchor.off <= m.pos.off) { anchor.clone() } else { m.pos.clone() };
+        if let Some(edit) = s.math.as_mut() {
+            edit.pos = pos;
+            edit.anchor = None;
+        }
+        return result(s);
+    }
     // Leaving a slot finishes what was typed there (AutoCorrect names, build-up).
     let latex = s.math_latex;
     let mut pos = m.pos.clone();
     let mut changed = false;
-    if !s.math_normal_text {
+    if !extend && !s.math_normal_text {
         with_eq(s, &m.at, |math, _| {
             if math.linear {
                 return;
@@ -343,7 +377,6 @@ fn move_caret(s: &mut Session, v: &Value) -> CmdResult {
     }
     let m = current(s)?;
     let nodes = nodes_of(s, &m.at).ok_or_else(|| CmdError::Failed("no equation there".into()))?;
-    let dir = p::str(v, "dir").unwrap_or("right");
     let next = match dir {
         "left" => me::move_left(&nodes, &m.pos),
         "right" => me::move_right(&nodes, &m.pos),
@@ -354,13 +387,35 @@ fn move_caret(s: &mut Session, v: &Value) -> CmdResult {
         "next" | "prev" => Some(me::next_placeholder(&nodes, &m.pos, dir == "prev").unwrap_or(m.pos.clone())),
         other => return Err(CmdError::Params(format!("unknown direction {other}"))),
     };
+    let next = next.map(|next| {
+        if extend && matches!(dir, "left" | "right") && next.path != m.pos.path && next.path.starts_with(&m.pos.path) {
+            let off = if dir == "right" { m.pos.off.checked_add(1) } else { m.pos.off.checked_sub(1) };
+            if let Some(off) = off {
+                return MathPos::new(m.pos.path.clone(), off);
+            }
+        }
+        next
+    });
     match next {
-        Some(p) => {
+        Some(next) => {
             if let Some(m) = s.math.as_mut() {
-                m.pos = p;
+                if extend {
+                    let anchor = m.anchor.clone().unwrap_or_else(|| m.pos.clone());
+                    if anchor.path != next.path {
+                        m.anchor = Some(next.clone());
+                    } else if anchor == next {
+                        m.anchor = None;
+                    } else {
+                        m.anchor = Some(anchor);
+                    }
+                } else {
+                    m.anchor = None;
+                }
+                m.pos = next;
             }
             result(s)
         }
+        None if extend => result(s),
         // Past either end: the caret leaves the equation.
         None => exit(s, &json!({"before": dir == "left"})),
     }
@@ -369,6 +424,19 @@ fn move_caret(s: &mut Session, v: &Value) -> CmdResult {
 fn delete(s: &mut Session, back: bool) -> CmdResult {
     let m = current(s)?;
     let nodes = nodes_of(s, &m.at).ok_or_else(|| CmdError::Failed("no equation there".into()))?;
+    if let Some(anchor) = &m.anchor {
+        let mut pos = m.pos.clone();
+        with_eq(s, &m.at, |math, _| {
+            if let Some(next) = me::delete_range(&mut math.nodes, anchor, &pos) {
+                pos = next;
+            }
+        })?;
+        if let Some(edit) = s.math.as_mut() {
+            edit.pos = pos;
+            edit.anchor = None;
+        }
+        return result(s);
+    }
     // An empty equation goes away entirely.
     if nodes.is_empty() {
         s.math = None;
@@ -412,6 +480,7 @@ fn enter(s: &mut Session, _: &Value) -> CmdResult {
     if changed {
         if let Some(m) = s.math.as_mut() {
             m.pos = pos;
+            m.anchor = None;
         }
         return result(s);
     }
@@ -461,6 +530,7 @@ fn convert(s: &mut Session, v: &Value) -> CmdResult {
         }
         if let Some(m) = s.math.as_mut() {
             m.pos = MathPos::default();
+            m.anchor = None;
         }
         s.clamp_selection();
         return Ok(json!({"converted": n}));
@@ -473,6 +543,7 @@ fn convert(s: &mut Session, v: &Value) -> CmdResult {
     })?;
     if let Some(m) = s.math.as_mut() {
         m.pos = MathPos::new(Vec::new(), end);
+        m.anchor = None;
     }
     result(s)
 }
@@ -553,6 +624,7 @@ fn set(s: &mut Session, v: &Value) -> CmdResult {
     })?;
     if let Some(m) = s.math.as_mut() {
         m.pos = MathPos::new(Vec::new(), end);
+        m.anchor = None;
     }
     result(s)
 }
@@ -599,6 +671,7 @@ fn structure(s: &mut Session, v: &Value) -> CmdResult {
     let pos = pos.ok_or_else(|| CmdError::Params(format!("{action} doesn't apply here")))?;
     if let Some(m) = s.math.as_mut() {
         m.pos = pos;
+        m.anchor = None;
     }
     result(s)
 }
@@ -636,6 +709,45 @@ mod tests {
 
     fn linear(s: &Session) -> String {
         s.math.as_ref().and_then(|m| s.doc.para_at(&m.at).and_then(|p| p.object_at(m.at.off))).map(|o| o.plain_text().to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn selection_inside_an_equation_extends_and_edits() {
+        let mut s = session();
+        s.run("insert.equation", &json!({"linear": "abcd"})).unwrap();
+        let at = s.math.as_ref().unwrap().at.clone();
+        s.run("equation.edit", &json!({"pos": {"path": [], "off": 1}})).unwrap();
+        s.run("equation.move", &json!({"dir": "right", "extend": true})).unwrap();
+        s.run("equation.move", &json!({"dir": "right", "extend": true})).unwrap();
+        let edit = s.math.as_ref().unwrap();
+        assert_eq!(edit.anchor, Some(MathPos::new(Vec::new(), 1)));
+        assert_eq!(edit.pos, MathPos::new(Vec::new(), 3));
+        assert_eq!(me::selected_linear(&nodes_of(&s, &at).unwrap(), edit.anchor.as_ref().unwrap(), &edit.pos).as_deref(), Some("bc"));
+
+        s.run("equation.type", &json!({"text": "X"})).unwrap();
+        assert_eq!(linear(&s), "aXd");
+        assert!(s.math.as_ref().unwrap().anchor.is_none());
+
+        s.run("equation.move", &json!({"dir": "left"})).unwrap();
+        s.run("equation.move", &json!({"dir": "right", "extend": true})).unwrap();
+        s.run("equation.move", &json!({"dir": "right", "extend": true})).unwrap();
+        s.run("equation.backspace", &json!({})).unwrap();
+        assert_eq!(linear(&s), "a");
+    }
+
+    #[test]
+    fn selection_can_include_a_whole_math_structure() {
+        let mut s = session();
+        s.run("insert.equation", &json!({"linear": "a+√x+b"})).unwrap();
+        s.run("equation.edit", &json!({"pos": {"path": [], "off": 2}})).unwrap();
+        s.run("equation.move", &json!({"dir": "right", "extend": true})).unwrap();
+        let edit = s.math.as_ref().unwrap();
+        assert_eq!(edit.anchor, Some(MathPos::new(Vec::new(), 2)));
+        assert_eq!(edit.pos, MathPos::new(Vec::new(), 3));
+        let nodes = nodes_of(&s, &edit.at).unwrap();
+        assert_eq!(me::selected_linear(&nodes, edit.anchor.as_ref().unwrap(), &edit.pos).as_deref(), Some("√x"));
+        s.run("equation.delete", &json!({})).unwrap();
+        assert_eq!(linear(&s), "a++b");
     }
 
     #[test]
