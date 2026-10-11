@@ -116,13 +116,13 @@ fn equation_key(app: &mut WordApp, key: Key, m: Modifiers) -> bool {
         return false;
     }
     let (id, params) = match key {
-        Key::ArrowLeft => ("equation.move", json!({"dir": "left"})),
-        Key::ArrowRight => ("equation.move", json!({"dir": "right"})),
-        Key::ArrowUp => ("equation.move", json!({"dir": "up"})),
-        Key::ArrowDown => ("equation.move", json!({"dir": "down"})),
-        Key::Home => ("equation.move", json!({"dir": "home"})),
-        Key::End => ("equation.move", json!({"dir": "end"})),
-        Key::Tab => ("equation.move", json!({"dir": if m.shift { "prev" } else { "next" }})),
+        Key::ArrowLeft => ("equation.move", json!({"dir": "left", "extend": m.shift})),
+        Key::ArrowRight => ("equation.move", json!({"dir": "right", "extend": m.shift})),
+        Key::ArrowUp => ("equation.move", json!({"dir": "up", "extend": m.shift})),
+        Key::ArrowDown => ("equation.move", json!({"dir": "down", "extend": m.shift})),
+        Key::Home => ("equation.move", json!({"dir": "home", "extend": m.shift})),
+        Key::End => ("equation.move", json!({"dir": "end", "extend": m.shift})),
+        Key::Tab => ("equation.move", json!({"dir": if m.shift { "prev" } else { "next" }, "extend": m.shift})),
         Key::Backspace => ("equation.backspace", json!({})),
         Key::Delete => ("equation.delete", json!({})),
         Key::Enter => ("equation.enter", json!({})),
@@ -169,6 +169,15 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
         // Editing an equation: text and editing keys go into it.
         if app.session.math.is_some() {
             match &e {
+                egui::Event::Copy | egui::Event::Cut => {
+                    if let Some(text) = equation_selection_text(app) {
+                        ctx.copy_text(text);
+                        if matches!(e, egui::Event::Cut) {
+                            let _ = app.run("equation.backspace", json!({}));
+                        }
+                        continue;
+                    }
+                }
                 egui::Event::Text(t) => {
                     let m = ctx.input(|i| i.modifiers);
                     if !(m.command || (m.ctrl && !cfg!(target_os = "macos"))) && !t.is_empty() && t.chars().all(|c| !c.is_control()) {
@@ -267,6 +276,18 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
     }
 }
 
+fn equation_selection_text(app: &WordApp) -> Option<String> {
+    let edit = app.session.math.as_ref()?;
+    let anchor = edit.anchor.as_ref()?;
+    if anchor == &edit.pos {
+        return None;
+    }
+    let object = app.session.doc.para_at(&edit.at)?.object_at(edit.at.off)?;
+    let wordcraft_doc::InlineObject::Equation { math, linear, .. } = object else { return None };
+    let nodes = if math.nodes.is_empty() && !math.linear { wordcraft_doc::math::parse_linear(linear) } else { math.nodes.clone() };
+    wordcraft_doc::math_edit::selected_linear(&nodes, anchor, &edit.pos)
+}
+
 /// Command shortcuts when the canvas isn't focused but no text field is either.
 pub fn global_shortcuts(app: &mut WordApp, ctx: &egui::Context) {
     if app.canvas.focused || ctx.egui_wants_keyboard_input() {
@@ -285,6 +306,23 @@ pub fn global_shortcuts(app: &mut WordApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wordcraft_doc::Document;
+    use wordcraft_engine::Session;
+
+    #[test]
+    fn shift_arrow_extends_an_equation_selection() {
+        let mut app = WordApp::new(Session::new(Document::new()), Default::default());
+        app.run("insert.equation", json!({"linear": "abcd"})).unwrap();
+        let at = app.session.math.as_ref().unwrap().at.clone();
+        app.run("equation.edit", json!({"pos": {"path": [], "off": 1}})).unwrap();
+        let shift = Modifiers { shift: true, ..Default::default() };
+        assert!(equation_key(&mut app, Key::ArrowRight, shift));
+        let edit = app.session.math.as_ref().unwrap();
+        assert_eq!(edit.anchor, Some(wordcraft_doc::math_edit::MathPos::new(Vec::new(), 1)));
+        assert_eq!(edit.pos, wordcraft_doc::math_edit::MathPos::new(Vec::new(), 2));
+        assert_eq!(app.session.math.as_ref().unwrap().at, at);
+        assert_eq!(equation_selection_text(&app).as_deref(), Some("b"));
+    }
 
     #[test]
     fn only_plain_paste_releases_paste_a_clipboard_picture() {

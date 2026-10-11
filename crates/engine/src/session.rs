@@ -275,6 +275,8 @@ pub struct MathEdit {
     pub at: Pos,
     /// The caret inside it.
     pub pos: wordcraft_doc::math_edit::MathPos,
+    /// The fixed end of an active selection inside the current argument.
+    pub anchor: Option<wordcraft_doc::math_edit::MathPos>,
 }
 
 /// Editing preferences that persist between runs (the front end saves and restores them).

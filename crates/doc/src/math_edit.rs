@@ -246,6 +246,33 @@ fn split_at(a: &mut Arg, off: usize) -> usize {
     }
 }
 
+/// The linear text represented by the selected units, when both endpoints are in one argument.
+pub fn selected_linear(root: &Arg, a: &MathPos, b: &MathPos) -> Option<String> {
+    if a.path != b.path {
+        return None;
+    }
+    let (start, end) = if a.off <= b.off { (a, b) } else { (b, a) };
+    let mut region = arg_at(root, &start.path)?.clone();
+    let start_i = split_at(&mut region, start.off);
+    let end_i = split_at(&mut region, end.off);
+    Some(to_linear(region.get(start_i..end_i)?))
+}
+
+/// Delete the selected units, when both endpoints are in one argument.
+pub fn delete_range(root: &mut Arg, a: &MathPos, b: &MathPos) -> Option<MathPos> {
+    if a.path != b.path {
+        return None;
+    }
+    let (start, end) = if a.off <= b.off { (a, b) } else { (b, a) };
+    let path = start.path.clone();
+    let arg = arg_at_mut(root, &path)?;
+    let start_i = split_at(arg, start.off);
+    let end_i = split_at(arg, end.off);
+    arg.drain(start_i..end_i);
+    tidy(root);
+    Some(clamp(root, &MathPos { path, off: start.off }))
+}
+
 fn compatible(r: &MRun, style: TypeStyle) -> bool {
     r.nor == style.nor && !r.lit
 }
@@ -1157,6 +1184,22 @@ mod tests {
         // Up from the denominator reaches the numerator.
         let den = MathPos::new(vec![(1, 1)], 1);
         assert_eq!(move_vertical(&eq, &den, true).unwrap().path, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn selected_math_text_can_be_copied_and_replaced() {
+        let mut eq = parse_linear("abcd");
+        let a = MathPos::new(Vec::new(), 1);
+        let b = MathPos::new(Vec::new(), 3);
+        assert_eq!(selected_linear(&eq, &a, &b).as_deref(), Some("bc"));
+        let caret = delete_range(&mut eq, &a, &b).unwrap();
+        assert_eq!(caret, a);
+        assert_eq!(lin(&eq), "ad");
+
+        let mut eq = parse_linear("a+√x+b");
+        let caret = delete_range(&mut eq, &MathPos::new(Vec::new(), 2), &MathPos::new(Vec::new(), 3)).unwrap();
+        assert_eq!(caret, MathPos::new(Vec::new(), 2));
+        assert_eq!(lin(&eq), "a++b");
     }
 
     #[test]

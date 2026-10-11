@@ -591,6 +591,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 pos2(pr.min.x + (ex + ml.width) * s + 2.0, pr.min.y + (base + ml.descent) * s + 2.0),
             );
             painter.rect_filled(zone, 2.0, Color32::from_black_alpha(16));
+            if let Some(anchor) = &m.anchor {
+                for (x, y, w, h) in ml.selection_rects(&anchor.path, anchor.off, m.pos.off) {
+                    let selected = Rect::from_min_size(pos2(pr.min.x + (ex + x) * s, pr.min.y + (base - y - h) * s), vec2(w * s, h * s));
+                    painter.rect_filled(selected, 0.0, t.selection);
+                }
+            }
             if let Some(slot) = ml.slot(&m.pos.path, m.pos.off) {
                 let x = (pr.min.x + (ex + slot.x) * s).round() + 0.5;
                 let y0 = pr.min.y + (base - slot.y - slot.a) * s;
@@ -1055,6 +1061,18 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
     {
         return;
     }
+    if app.canvas.dragging && ui.input(|i| i.pointer.primary_released()) {
+        app.canvas.dragging = false;
+        app.canvas.column_drag = None;
+        if let Some(edit) = app.session.math.as_mut()
+            && edit.anchor.as_ref() == Some(&edit.pos)
+        {
+            edit.anchor = None;
+        }
+        if app.session.painter.is_some() && !app.session.sel.is_collapsed() {
+            let _ = app.run("edit.pasteFormat", json!({}));
+        }
+    }
     let Some(p) = pointer else { return };
     let Some((page, x, y)) = page_at(rects, layout, scale, p) else { return };
     let mods = ui.input(|i| i.modifiers);
@@ -1109,12 +1127,31 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
                 _ => story,
             }
         };
-        if !mods.shift
-            && let Some((at, inner)) = layout.equation_hit(page, x, y, story)
-        {
-            app.session.sel = wordcraft_engine::Selection::caret(at);
-            let _ = app.run("equation.edit", json!({"pos": serde_json::to_value(&inner).unwrap_or_default()}));
+        if let Some((at, mut inner)) = layout.equation_hit(page, x, y, story) {
+            if mods.shift && app.session.math.as_ref().is_some_and(|m| m.at == at) {
+                if let Some(edit) = app.session.math.as_ref()
+                    && edit.pos.path != inner.path
+                    && let Some((pi, ex, base, ml)) = layout.equation_geom(&at, page)
+                    && pi == page
+                    && let Some(slot) = ml.hit_in_path(x - ex, base - y, &edit.pos.path)
+                {
+                    inner = wordcraft_doc::math_edit::MathPos { path: slot.path.clone(), off: slot.off };
+                }
+                if let Some(edit) = app.session.math.as_mut() {
+                    if edit.anchor.is_none() {
+                        edit.anchor = Some(edit.pos.clone());
+                    }
+                    edit.pos = inner;
+                }
+            } else {
+                app.session.sel = wordcraft_engine::Selection::caret(at);
+                let _ = app.run("equation.edit", json!({"pos": serde_json::to_value(&inner).unwrap_or_default()}));
+                if let Some(edit) = app.session.math.as_mut() {
+                    edit.anchor = Some(edit.pos.clone());
+                }
+            }
             app.session.page_hint = page;
+            app.canvas.dragging = true;
             return;
         }
         if app.session.math.is_some() {
@@ -1164,7 +1201,16 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
             );
         }
     } else if app.canvas.dragging && ui.input(|i| i.pointer.primary_down()) {
-        if let Some(pos) = layout.hit(page, x, y, story)
+        if let Some(m) = app.session.math.clone() {
+            if let Some(anchor) = m.anchor.as_ref()
+                && let Some((pi, ex, base, ml)) = layout.equation_geom(&m.at, page)
+                && pi == page
+                && let Some(slot) = ml.hit_in_path(x - ex, base - y, &anchor.path)
+                && let Some(edit) = app.session.math.as_mut()
+            {
+                edit.pos = wordcraft_doc::math_edit::MathPos { path: slot.path.clone(), off: slot.off };
+            }
+        } else if let Some(pos) = layout.hit(page, x, y, story)
             && pos != app.session.sel.focus
         {
             app.session.sel.focus = pos;
@@ -1172,12 +1218,6 @@ fn mouse(app: &mut WordApp, ui: &Ui, resp: &egui::Response, rects: &[Rect], layo
             app.canvas.caret_visible_since = crate::now_ms();
         }
         // Auto-scroll near the edges is handled by egui's scroll area drag.
-    } else if app.canvas.dragging && ui.input(|i| i.pointer.primary_released()) {
-        app.canvas.dragging = false;
-        app.canvas.column_drag = None;
-        if app.session.painter.is_some() && !app.session.sel.is_collapsed() {
-            let _ = app.run("edit.pasteFormat", json!({}));
-        }
     }
     // Hover a link: show its target.
     if resp.hovered()
@@ -1745,6 +1785,44 @@ mod tests {
         assert_eq!(h.state().session.undo_depth(), depth + 1, "one undo step for the edit");
         assert!(h.state_mut().session.undo());
         assert_eq!(h.state().session.doc.plain_text(StoryRef::Part(part)), "Original");
+    }
+
+    #[test]
+    fn dragging_inside_an_equation_selects_its_text() {
+        let mut app = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        app.run("insert.equation", json!({"linear": "abcd"})).unwrap();
+        let at = app.session.math.as_ref().unwrap().at.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        for _ in 0..5 {
+            h.step();
+        }
+        let layout = h.state_mut().session.layout();
+        let (page, ex, base, ml) = layout.equation_geom(&at, 0).unwrap();
+        let page_rect = h.state().canvas.page_rects[page];
+        let scale = page_screen_scale(page_rect, &layout.pages[page], h.state().canvas.scale);
+        let point = |off| {
+            let slot = ml.slot(&[], off).unwrap();
+            pos2(page_rect.min.x + (ex + slot.x) * scale, page_rect.min.y + (base - slot.y) * scale)
+        };
+        let start = point(1);
+        let end = point(3);
+        h.event(egui::Event::PointerMoved(start));
+        h.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.step();
+        h.event(egui::Event::PointerMoved(end));
+        h.step();
+        h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.step();
+        let edit = h.state().session.math.as_ref().unwrap();
+        assert_eq!(edit.anchor, Some(wordcraft_doc::math_edit::MathPos::new(Vec::new(), 1)));
+        assert_eq!(edit.pos, wordcraft_doc::math_edit::MathPos::new(Vec::new(), 3));
     }
 
     #[test]

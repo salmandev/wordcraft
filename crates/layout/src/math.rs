@@ -113,6 +113,34 @@ impl MathLayout {
     pub fn hit(&self, x: f32, y: f32) -> Option<&Slot> {
         self.slots.iter().min_by(|a, b| slot_dist(a, x, y).total_cmp(&slot_dist(b, x, y)))
     }
+
+    /// The caret nearest to (`x`, `y`) within one argument.
+    pub fn hit_in_path(&self, x: f32, y: f32, path: &[(usize, usize)]) -> Option<&Slot> {
+        self.slots.iter().filter(|s| s.path == path).min_by(|a, b| slot_dist(a, x, y).total_cmp(&slot_dist(b, x, y)))
+    }
+
+    /// Selection rectangles for an offset range in one argument, in equation coordinates.
+    /// Rectangles are `(left, bottom, width, height)` with y measured up from the baseline.
+    pub fn selection_rects(&self, path: &[(usize, usize)], a: usize, b: usize) -> Vec<(f32, f32, f32, f32)> {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = Vec::new();
+        let mut off = start;
+        for _ in 0..(end - start).min(self.slots.len()) {
+            let Some(next) = off.checked_add(1) else { break };
+            let current = off;
+            off = next;
+            let Some(left) = self.slots.iter().find(|s| s.path == path && s.off == current) else { continue };
+            let Some(right) = self.slots.iter().find(|s| s.path == path && s.off == next) else { continue };
+            let x = left.x.min(right.x);
+            let width = (right.x - left.x).abs();
+            let top = (left.y + left.a).max(right.y + right.a);
+            let bottom = (left.y - left.d).min(right.y - right.d);
+            if width > 0.0 && top > bottom {
+                out.push((x, bottom, width, top - bottom));
+            }
+        }
+        out
+    }
 }
 
 fn slot_dist(s: &Slot, x: f32, y: f32) -> f32 {
@@ -1961,6 +1989,22 @@ fn hcat(parts: Vec<Bx>) -> Bx {
 mod tests {
     use super::*;
     use wordcraft_doc::math::Math;
+
+    #[test]
+    fn equation_selection_geometry_stays_in_its_argument() {
+        let path = vec![(0, 1)];
+        let layout = MathLayout {
+            slots: vec![
+                Slot { path: path.clone(), off: 0, x: 0.0, y: 2.0, a: 5.0, d: 2.0 },
+                Slot { path: path.clone(), off: 1, x: 8.0, y: 2.0, a: 5.0, d: 2.0 },
+                Slot { path: path.clone(), off: 2, x: 13.0, y: 2.0, a: 5.0, d: 2.0 },
+                Slot { path: vec![], off: 0, x: 30.0, y: 0.0, a: 7.0, d: 3.0 },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(layout.hit_in_path(12.0, 2.0, &path).map(|s| s.off), Some(2));
+        assert_eq!(layout.selection_rects(&path, 0, 2), vec![(0.0, 0.0, 8.0, 7.0), (8.0, 0.0, 5.0, 7.0)]);
+    }
 
     fn rc() -> ResolvedChar {
         wordcraft_doc::styles::StyleSheet::default().resolve_char(None, &Default::default())
